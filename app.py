@@ -7,7 +7,11 @@ import folium
 import requests
 from streamlit_folium import st_folium
 from datetime import time, date
-from supabase import create_client, Client
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+from datetime import date as _date, datetime as _datetime
+from decimal import Decimal
 from collections import defaultdict
 
 # Set page layout
@@ -102,17 +106,52 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         return default
 
-# --- Database Connection ---
+# --- Database Connection (Railway Postgres) ---
 @st.cache_resource
-def init_connection() -> Client:
-    url = get_secret("SUPABASE_URL")
-    key = get_secret("SUPABASE_KEY")
-    if not url or not key:
-        st.error("SUPABASE_URL / SUPABASE_KEY are not set. Add them as environment variables.")
+def init_pool() -> ConnectionPool:
+    url = get_secret("DATABASE_URL")
+    if not url:
+        st.error("DATABASE_URL is not set. Add it as an environment variable (reference your Railway Postgres service).")
         st.stop()
-    return create_client(url, key)
+    # check=ConnectionPool.check_connection transparently replaces dead connections
+    return ConnectionPool(
+        url,
+        min_size=1,
+        max_size=5,
+        kwargs={"row_factory": dict_row, "autocommit": True},
+        check=ConnectionPool.check_connection,
+        open=True,
+    )
 
-supabase = init_connection()
+pool = init_pool()
+
+
+def _clean(value):
+    """Convert Postgres types to the plain Python types the rest of the app expects."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (_datetime, _date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _clean(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean(v) for v in value]
+    return value
+
+
+class DBResult:
+    """Mimics the old Supabase response so existing `.data` code keeps working."""
+    def __init__(self, data):
+        self.data = data
+
+
+def db(sql: str, params=None) -> DBResult:
+    """Run any SQL statement. SELECT / RETURNING queries give back a list of dicts in `.data`."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = [_clean(r) for r in cur.fetchall()] if cur.description else []
+    return DBResult(rows)
 
 # -------------------------------------------------------------------
 # Helper Functions: Geodesic Calculations & Parsers
@@ -409,8 +448,8 @@ def render_task_gallery_page():
     st.title("🗺️ Task Gallery")
     st.markdown("Browse available cross-country tasks, preview route turnpoints, and download task files for your flight computer.")
 
-    # Fetch tasks from Supabase
-    response = supabase.table("tasks").select("*").execute()
+    # Fetch tasks from the database
+    response = db("SELECT * FROM tasks")
     tasks_data = response.data
 
     if not tasks_data:
@@ -504,7 +543,13 @@ def render_pilot_registration_page():
                 "pg_level": pg_level
             }
             try:
-                supabase.table("pilots").upsert(pilot_data).execute()
+                db(
+                    """INSERT INTO pilots (safa_number, name, pg_level)
+                       VALUES (%(safa_number)s, %(name)s, %(pg_level)s)
+                       ON CONFLICT (safa_number)
+                       DO UPDATE SET name = EXCLUDED.name, pg_level = EXCLUDED.pg_level""",
+                    {**pilot_data, "safa_number": int(pilot_data["safa_number"])},
+                )
                 st.success(f"Successfully registered {full_name} (SAFA: {safa_number})!")
                 st.info("You can now navigate to the 'Flight Upload' page to submit your flights.")
             except Exception as e:
@@ -516,7 +561,7 @@ def render_flight_upload_page():
     st.markdown("Select a task, upload your IGC file, preview your flight, and submit your score.")
 
     # Fetch tasks from DB
-    response = supabase.table("tasks").select("*").execute()
+    response = db("SELECT * FROM tasks")
     tasks_data = response.data
 
     if not tasks_data:
@@ -563,7 +608,7 @@ def render_flight_upload_page():
         elif igc_file.size > 2 * 1024 * 1024:
             st.error("File size exceeds the 2 MB limit.")
         else:
-            pilot_check = supabase.table("pilots").select("name").eq("safa_number", safa_number).execute()
+            pilot_check = db("SELECT name FROM pilots WHERE safa_number = %s", (int(safa_number),))
 
             if not pilot_check.data:
                 st.error("SAFA number not found. Please register first in the Pilot Registration page.")
@@ -669,10 +714,19 @@ def render_flight_upload_page():
                 "flight_time_minutes": flight_time,
                 "participants": 1
             }
-            supabase.table("flights").insert(flight_data).execute()
+            db(
+                """INSERT INTO flights
+                   (pilot_id, task_id, flight_date, glider_class, paraglider,
+                    base_distance_score, speed_score, distance_score, total_score,
+                    flight_time_minutes, participants)
+                   VALUES (%(pilot_id)s, %(task_id)s, %(flight_date)s, %(glider_class)s, %(paraglider)s,
+                           %(base_distance_score)s, %(speed_score)s, %(distance_score)s, %(total_score)s,
+                           %(flight_time_minutes)s, %(participants)s)""",
+                {**flight_data, "pilot_id": int(flight_data["pilot_id"])},
+            )
 
             # Master Recalculation Engine - Updated Formula Implementation
-            flights_res = supabase.table("flights").select("*").eq("task_id", selected_task['id']).execute()
+            flights_res = db("SELECT * FROM flights WHERE task_id = %s", (selected_task['id'],))
             all_task_flights = flights_res.data
 
             if all_task_flights:
@@ -714,12 +768,12 @@ def render_flight_upload_page():
                     final_speed = base_speed * day_factor
                     final_total = final_dist + final_speed
 
-                    supabase.table("flights").update({
-                        "speed_score": round(final_speed, 2),
-                        "distance_score": round(final_dist, 2),
-                        "total_score": round(final_total, 2),
-                        "participants": unique_count
-                    }).eq("id", f["id"]).execute()
+                    db(
+                        """UPDATE flights
+                           SET speed_score = %s, distance_score = %s, total_score = %s, participants = %s
+                           WHERE id = %s""",
+                        (round(final_speed, 2), round(final_dist, 2), round(final_total, 2), unique_count, f["id"]),
+                    )
 
             st.success(f"Flight submitted! Scores for {selected_task['description']} updated based on global speed and daily team sizes.")
             del st.session_state["eval_data"]
@@ -759,12 +813,15 @@ def render_admin_page():
                             "max_score": max_score,
                             "task_hash": task_hash.strip()
                         }
-                        supabase.table("tasks").insert(task_data).execute()
+                        db(
+                            "INSERT INTO tasks (description, designer, max_score, task_hash) VALUES (%(description)s, %(designer)s, %(max_score)s, %(task_hash)s)",
+                            task_data,
+                        )
                         st.success("Task added successfully via Hash!")
 
     with tab2:
         st.subheader("Existing Tasks")
-        response = supabase.table("tasks").select("id, description, designer, max_score, task_hash").execute()
+        response = db("SELECT id, description, designer, max_score, task_hash FROM tasks")
         if response.data:
             df = pd.DataFrame(response.data)
             df = df.sort_values(by="description").reset_index(drop=True)
@@ -772,7 +829,7 @@ def render_admin_page():
 
             del_id = st.number_input("Task ID to Delete", min_value=1, step=1)
             if st.button("Delete Task", type="primary"):
-                supabase.table("tasks").delete().eq("id", del_id).execute()
+                db("DELETE FROM tasks WHERE id = %s", (int(del_id),))
                 st.success("Task deleted. Refresh to update table.")
 
 def render_leaderboard_page():
@@ -781,7 +838,15 @@ def render_leaderboard_page():
     category_options = ["Overall", "Only As", "As and Bs", "Only PG2s", "PG2s and PG3s", "PG4 or less"]
     category_filter = st.selectbox("Category", options=category_options)
 
-    flights_res = supabase.table("flights").select("*, pilots(name, safa_number, pg_level), tasks(id, description, max_score, task_hash)").execute()
+    flights_res = db("""
+        SELECT f.*,
+               json_build_object('name', p.name, 'safa_number', p.safa_number, 'pg_level', p.pg_level) AS pilots,
+               json_build_object('id', t.id, 'description', t.description,
+                                 'max_score', t.max_score, 'task_hash', t.task_hash) AS tasks
+        FROM flights f
+        LEFT JOIN pilots p ON p.safa_number = f.pilot_id
+        LEFT JOIN tasks  t ON t.id = f.task_id
+    """)
 
     if not flights_res.data:
         st.info("No flights recorded yet.")
@@ -816,7 +881,7 @@ def render_leaderboard_page():
         st.info(f"No flights found for category: {category_filter}")
         return
 
-    tasks_res = supabase.table("tasks").select("*").execute()
+    tasks_res = db("SELECT * FROM tasks")
     tasks_data = tasks_res.data if tasks_res.data else []
 
     # Sort tasks by description
