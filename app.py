@@ -423,7 +423,7 @@ def render_how_it_works_page():
     \text{Distance score} = \text{Day factor} \times \text{Task max score} \times 0.5 \times \left( \frac{\text{Distance covered by pilot}}{\text{Total task distance}} \right)
     $$
     $$
-    \text{Speed score} = \text{Day factor} \times  \text{Task max score} \times 0.5 \times \left( \text{If reached goal 1 otherwise 0} \right)  \times \left( \frac{\text{Pilot time}}{\text{Fastest time}} \right)
+    \text{Speed score} = \text{Day factor} \times  \text{Task max score} \times 0.5 \times \left( \text{If reached goal 1 otherwise 0} \right)  \times \left( \frac{\text{Fastest time}}{\text{Pilot time}} \right)
     $$
     $$
     \text{Total score of a task} = \text{Distance score} + \text{Speed score}
