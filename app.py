@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import pandas as pd
@@ -125,6 +126,42 @@ def init_pool() -> ConnectionPool:
 
 pool = init_pool()
 
+# --- IGC file storage (Railway volume) ---
+# Mount a Railway Volume at /skyhigh_voyagers/storage (or override with STORAGE_ROOT).
+# Layout: {STORAGE_ROOT}/task_{task_id}/date_{YYYY-MM-DD}/{safa_number}.igc
+STORAGE_ROOT = get_secret("STORAGE_ROOT", "/skyhigh_voyagers/storage")
+
+
+@st.cache_resource
+def ensure_schema():
+    """Adds the igc_path column to the flights table if it doesn't exist yet (safe to run every start)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE flights ADD COLUMN IF NOT EXISTS igc_path TEXT")
+    return True
+
+ensure_schema()
+
+
+def save_igc_file(task_id, flight_date: str, safa_number, igc_bytes: bytes) -> str:
+    """Saves the raw IGC file to
+        {STORAGE_ROOT}/task_{task_id}/date_{flight_date}/{safa_number}.igc
+    and returns the full path. Re-uploading for the same pilot/task/date overwrites the file.
+    All path parts are built from validated ints / ISO dates, so no user text reaches the path."""
+    task_id = int(task_id)
+    safa_number = int(safa_number)
+    flight_date = _date.fromisoformat(str(flight_date)).isoformat()
+
+    folder = os.path.join(STORAGE_ROOT, f"task_{task_id}", f"date_{flight_date}")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{safa_number}.igc")
+
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as fh:
+        fh.write(igc_bytes)
+    os.replace(tmp_path, path)  # atomic: never leaves a half-written file
+    return path
+
 
 def _clean(value):
     """Convert Postgres types to the plain Python types the rest of the app expects."""
@@ -168,28 +205,72 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
 
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
-def parse_igc(igc_text):
-    """Parses IGC file B-records into a Pandas DataFrame."""
+
+# --- IGC header parsing (tolerant of different loggers / apps) ---
+# Date header variants seen in the wild:
+#   HFDTE191026           classic IGC
+#   HFDTE:191026          some loggers
+#   HFDTEDATE:191026,00   XCTrack / newer IGC spec (",00" is the flight number of the day)
+_DTE_RE = re.compile(r"^H[FOPS]?DTE(?:DATE)?\s*[:=]?\s*(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
+# A YYYY-MM-DD (or YYYYMMDD, YYYY_MM_DD, YYYY.MM.DD) date inside the file name
+_FILENAME_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})(?!\d)")
+# Pilot header variants: HFPLTPILOT:, HFPLTPILOTINCHARGE:, HFPLT:
+_PILOT_RE = re.compile(r"^H[FOPS]?PLT(?:PILOT(?:INCHARGE)?)?\s*:?\s*(.*)$", re.IGNORECASE)
+
+
+def extract_igc_date(igc_text, filename=None):
+    """Returns (date | None, source).
+
+    Tries, in order:
+      1. the IGC header date record (all common variants above)
+      2. a date embedded in the file name (e.g. 2026-10-19-XCT-MLO-00.igc)
+    """
+    for line in igc_text.splitlines():
+        m = _DTE_RE.match(line.strip())
+        if m:
+            dd, mm, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            year = 2000 + yy if yy < 70 else 1900 + yy
+            try:
+                return _date(year, mm, dd), "IGC header"
+            except ValueError:
+                pass  # corrupt header value, fall through to next source
+
+    if filename:
+        m = _FILENAME_DATE_RE.search(filename)
+        if m:
+            try:
+                return _date(int(m.group(1)), int(m.group(2)), int(m.group(3))), "file name"
+            except ValueError:
+                pass
+    return None, None
+
+
+def parse_igc(igc_text, filename=None):
+    """Parses IGC file B-records into a Pandas DataFrame.
+
+    Returns (df, pilot_name, flight_date_iso_or_'Unknown', date_source).
+    """
     records = []
     pilot_name = "Unknown"
-    date_str = "Unknown"
+
+    detected_date, date_source = extract_igc_date(igc_text, filename)
+    date_str = detected_date.isoformat() if detected_date else "Unknown"
 
     for line in igc_text.splitlines():
-        if line.startswith("HFPLTPILOT:"):
-            pilot_name = line.split(":", 1)[1].strip()
-        elif line.startswith("HFDTE"):
-            date_str = line[5:11]
-            if len(date_str) == 6:
-                # Format YYMMDD to YYYY-MM-DD for better readability
-                date_str = f"20{date_str[4:6]}-{date_str[2:4]}-{date_str[0:2]}"
+        line = line.strip()
+
+        if line.upper().startswith(("HFPLT", "HOPLT", "HPPLT")):
+            m = _PILOT_RE.match(line)
+            if m and m.group(1).strip():
+                pilot_name = m.group(1).strip()
 
         if line.startswith("B") and len(line) >= 35:
             try:
                 time_str = f"{line[1:3]}:{line[3:5]}:{line[5:7]}"
 
                 # Parse Time object for validation logic
-                h, m, s = map(int, [line[1:3], line[3:5], line[5:7]])
-                parsed_time = time(h, m, s)
+                h, m_, s = int(line[1:3]), int(line[3:5]), int(line[5:7])
+                parsed_time = time(h, m_, s)
 
                 lat_deg = int(line[7:9])
                 lat_min = float(f"{line[9:11]}.{line[11:14]}")
@@ -209,7 +290,7 @@ def parse_igc(igc_text):
                 })
             except Exception:
                 continue
-    return pd.DataFrame(records), pilot_name, date_str
+    return pd.DataFrame(records), pilot_name, date_str, date_source
 
 def validate_task_flight(task_data: dict, igc_fixes: list) -> dict:
     """Validates IGC fixes sequentially against task turnpoints and calculates times/distances.
@@ -581,10 +662,14 @@ def render_flight_upload_page():
             paraglider = st.text_input("Paraglider (e.g., Flow Cosmos 2)")
 
         flight_date_input = st.date_input(
-            "Date of Flight",
+            "Date of Flight (optional)",
             value=None,
             max_value=date.today(),
-            help="Select the date you actually flew. Some flight instruments record the wrong date/time zone, so we use the date you enter here instead of the one embedded in the IGC file."
+            help=(
+                "Leave empty to use the date detected from your IGC file (header or file name). "
+                "Fill it in only if your flight instrument recorded the wrong date / time zone — "
+                "a date entered here always takes priority."
+            )
         )
 
         # Task Selection
@@ -601,8 +686,6 @@ def render_flight_upload_page():
             st.error("Please enter your SAFA Number.")
         elif glider_class is None:
             st.error("Please select your Glider Class.")
-        elif flight_date_input is None:
-            st.error("Please select the Date of Flight.")
         elif not igc_file:
             st.error("Please upload an IGC file.")
         elif igc_file.size > 2 * 1024 * 1024:
@@ -620,17 +703,28 @@ def render_flight_upload_page():
                 if not task_json:
                     st.error("Could not retrieve task parameters from XContest API. Validation cannot proceed.")
                 else:
-                    igc_content = igc_file.read().decode("utf-8", errors="ignore")
-                    igc_df, parsed_name, igc_flight_date = parse_igc(igc_content)
+                    igc_bytes = igc_file.getvalue()  # raw bytes, kept so we can store the original file on submit
+                    igc_content = igc_bytes.decode("utf-8", errors="ignore")
+                    igc_df, parsed_name, igc_flight_date, date_source = parse_igc(igc_content, igc_file.name)
 
-                    # We no longer trust the date embedded in the IGC file — some
-                    # recording devices don't save it properly or have timezone
-                    # issues. The pilot-selected date from the form is used instead
-                    # as the flight's official date of record.
-                    flight_date = flight_date_input.isoformat()
+                    # Date priority:
+                    #   1. date the pilot typed into the form (explicit override)
+                    #   2. date detected from the IGC header
+                    #   3. date detected from the IGC file name
+                    if flight_date_input is not None:
+                        flight_date = flight_date_input.isoformat()
+                        flight_date_source = "entered manually"
+                    elif igc_flight_date != "Unknown":
+                        flight_date = igc_flight_date
+                        flight_date_source = date_source
+                    else:
+                        flight_date = None
+                        flight_date_source = None
 
                     if igc_df.empty:
                         st.error("Invalid IGC file or no valid fixes found.")
+                    elif flight_date is None:
+                        st.error("Could not detect a flight date in this IGC file. Please enter the Date of Flight manually.")
                     else:
                         validation_results = validate_task_flight(task_json, igc_df.to_dict('records'))
                         max_score = float(selected_task['max_score'])
@@ -650,7 +744,9 @@ def render_flight_upload_page():
                             "selected_task": selected_task,
                             "task_json": task_json,
                             "igc_df": igc_df,
+                            "igc_bytes": igc_bytes,
                             "flight_date": flight_date,
+                            "flight_date_source": flight_date_source,
                             "igc_flight_date": igc_flight_date,
                             "validation_results": validation_results,
                             "base_distance_score": base_distance_score,
@@ -668,10 +764,10 @@ def render_flight_upload_page():
         st.markdown("---")
         st.subheader("📑 Evaluation Preview")
         st.write(f"**Pilot:** {data['pilot_name']} (SAFA: {data['safa_number']})")
-        st.write(f"**Flight Date:** {data['flight_date']}")
+        st.write(f"**Flight Date:** {data['flight_date']} _(source: {data.get('flight_date_source')})_")
         igc_flight_date = data.get("igc_flight_date")
         if igc_flight_date and igc_flight_date != "Unknown" and igc_flight_date != data['flight_date']:
-            st.caption(f"ℹ️ Note: the IGC file itself reports {igc_flight_date} as its date, but the date you entered ({data['flight_date']}) is what will be recorded.")
+            st.warning(f"The IGC file reports {igc_flight_date}, but the date you entered ({data['flight_date']}) will be recorded.")
         st.write(f"**Turnpoints Reached:** {validation_results['turnpoints_completed']} / {validation_results['total_turnpoints']}")
         st.write(f"**Estimated Distance Score:** {round(estimated_score, 2)}")
         if not validation_results['task_completed']:
@@ -701,6 +797,15 @@ def render_flight_upload_page():
         if st.button("Submit Flight to Database", type="primary"):
             flight_time = data["validation_results"].get('flight_time_mins')
 
+            # Save the original IGC file first; if that fails, don't create a DB record without it.
+            try:
+                igc_path = save_igc_file(
+                    selected_task['id'], data["flight_date"], data["safa_number"], data["igc_bytes"]
+                )
+            except Exception as e:
+                st.error(f"Could not save the IGC file to storage: {e}")
+                st.stop()
+
             flight_data = {
                 "pilot_id": data["safa_number"],
                 "task_id": selected_task['id'],
@@ -712,16 +817,17 @@ def render_flight_upload_page():
                 "distance_score": round(data["base_distance_score"], 2),
                 "total_score": round(data["base_distance_score"], 2),
                 "flight_time_minutes": flight_time,
-                "participants": 1
+                "participants": 1,
+                "igc_path": igc_path
             }
             db(
                 """INSERT INTO flights
                    (pilot_id, task_id, flight_date, glider_class, paraglider,
                     base_distance_score, speed_score, distance_score, total_score,
-                    flight_time_minutes, participants)
+                    flight_time_minutes, participants, igc_path)
                    VALUES (%(pilot_id)s, %(task_id)s, %(flight_date)s, %(glider_class)s, %(paraglider)s,
                            %(base_distance_score)s, %(speed_score)s, %(distance_score)s, %(total_score)s,
-                           %(flight_time_minutes)s, %(participants)s)""",
+                           %(flight_time_minutes)s, %(participants)s, %(igc_path)s)""",
                 {**flight_data, "pilot_id": int(flight_data["pilot_id"])},
             )
 
