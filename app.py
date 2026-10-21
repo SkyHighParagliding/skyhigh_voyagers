@@ -20,7 +20,7 @@ st.set_page_config(page_title="SkyHigh Voyagers", layout="wide")
 
 # --- Custom CSS for Menu Toggle ---
 st.markdown("""
-<style>
+<style> 
 /* More breathing room between options */
 [data-testid="stRadioGroup"] {
     gap: 4px !important;
