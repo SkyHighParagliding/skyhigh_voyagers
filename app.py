@@ -477,7 +477,7 @@ def render_how_it_works_page():
     st.markdown(r"""
     We are a passionate team of pilots dedicated to promoting skill development within our sport. Our mission is to support pilot progression, foster friendly task flying, and build a vibrant Cross Country (XC) community.
     ### Meet the Teams Behind the Scenes
-    We are a team of volenteers. To keep everything running smoothly and safely, our operations are divided into three dedicated groups:
+    We are a team of volunteers. To keep everything running smoothly and safely, our operations are divided into three dedicated groups:
 
     * **The Admin Team:** This team manages the app and ensures all technical aspects run flawlessly. They actively build and maintain strong relationships with local clubs and SAFA, ensuring all tasks are in strict accordance with regulations.
     * **The Task Team:** Focused on course design, this team creates diverse and engaging tasks aimed at developing paragliding skills while prioritizing safety. They are also responsible for continually reviewing and refining the scoring system.
@@ -491,8 +491,8 @@ def render_how_it_works_page():
     To maximize your score, aim to fly with at least 4 more pilots and reach the goal as quickly as possible while staying safe and within your skill level.
     Your results will be compared against all other pilots who flew the same task in the whole season.
     As the score will be adjusted based on how many pilots participated that day, please upload your tracklog even if you had a slow flight or did not reach the goal. Every flight counts toward the community and your own skill development!
-    We highly recommend to reach out to the safety officers or experience pilots and ask them about tips and tricks of flying the routes safely.
-    If you are new to the route, we also recommend fly with experienced local pilots who flew the route before.
+    We highly recommend to reach out to the safety officers or experienced pilots and ask them about tips and tricks of flying the routes safely.
+    If you are new to the route, we also recommend to fly with experienced local pilots who have flown the route before.
 
 
     #### Details of the scoring system are as follows:
@@ -515,10 +515,10 @@ def render_how_it_works_page():
 
     The score components are defined as follows:
 
-    * **Day factor:** A multiplier based on how many pilots fly the same task on the same day. It is 1.0 for 5 or more pilots and reduces proportionally for fewer pilots to reward group participation. If task were flown by 3 pilots, the day factor would be 0.8 (0.5 + 0.5 * 3/5).
+    * **Day factor:** A multiplier based on how many pilots fly the same task on the same day. It is 1.0 for 5 or more pilots and reduces proportionally for fewer pilots to reward group participation. If task was flown by 3 pilots, the day factor would be 0.8 (0.5 + 0.5 * 3/5).
     * **Task max score:** Each task has a maximum score based on its nominal distance and difficulty (e.g., 300 points for short and easy tasks, 1000 points for longer and difficult tasks). The maximum score is split evenly between distance and speed components and set by task designers.
     * **Distance score:** The portion of the score earned for the distance covered by the pilot relative to the total task distance. It is calculated using the day factor, task max score, and the distance ratio. So if you fly half the task distance, you earn only half of the possible maximum distance score.
-    * **Speed score:** The portion of the score earned for reaching the goal and completing the speed section quickly compared to the fastest pilot. It is only awarded if the pilot reached the goal. The speed score for  pilots is calculated based on their time relative to the fastest pilot's time. So if it takes twice for you to finish the task compared to fastest pilot,your speed score will be half of the maximum speed score, while faster pilots earn the full speed score. The day factor is also applied to the speed score.
+    * **Speed score:** The portion of the score earned for reaching the goal and completing the speed section quickly compared to the fastest pilot. It is only awarded if the pilot reached the goal. The speed score for  pilots is calculated based on their time relative to the fastest pilot's time. So if it takes twice as long for you to finish the task compared to fastest pilot, your speed score will be half of the maximum speed score, while faster pilots earn the full speed score. The day factor is also applied to the speed score.
     * **Total score of a task:** The sum of the distance score and the speed score after applying the day factor and task maximum score.
     * **Leaderboard overall score:** The overall score for each pilot across all tasks is calculated by summing the best **seven** scores of all tasks they have flown. This overall score determines their ranking on the leaderboard.
 
