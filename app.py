@@ -20,7 +20,7 @@ st.set_page_config(page_title="SkyHigh Voyagers", layout="wide")
 
 # --- Custom CSS for Menu Toggle ---
 st.markdown("""
-<style> 
+<style>
 /* More breathing room between options */
 [data-testid="stRadioGroup"] {
     gap: 4px !important;
@@ -677,7 +677,7 @@ def render_flight_upload_page():
         selected_task_label = st.selectbox("Select Task", options=list(task_options.keys()))
         selected_task = task_options[selected_task_label]
 
-        igc_file = st.file_uploader("Upload Tracklog File (.igc)", type=["igc"])
+        igc_file = st.file_uploader("Upload Tracklog File (.igc)")
 
         preview_button = st.form_submit_button("Preview & Evaluate")
 
