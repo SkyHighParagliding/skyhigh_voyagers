@@ -1,5 +1,6 @@
 import os
 import re
+import time as _time
 import json
 import math
 import pandas as pd
@@ -134,10 +135,13 @@ STORAGE_ROOT = get_secret("STORAGE_ROOT", "/skyhigh_voyagers/storage")
 
 @st.cache_resource
 def ensure_schema():
-    """Adds the igc_path column to the flights table if it doesn't exist yet (safe to run every start)."""
+    """Adds any missing columns (safe to run every start):
+       - flights.igc_path  : where the raw IGC file is stored
+       - tasks.take_off    : name of the take-off site of the task"""
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE flights ADD COLUMN IF NOT EXISTS igc_path TEXT")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS take_off TEXT")
     return True
 
 ensure_schema()
@@ -161,6 +165,107 @@ def save_igc_file(task_id, flight_date: str, safa_number, igc_bytes: bytes) -> s
         fh.write(igc_bytes)
     os.replace(tmp_path, path)  # atomic: never leaves a half-written file
     return path
+
+
+# --- Task image storage (Railway volume) ---
+# Layout: {STORAGE_ROOT}/task_images/{task_hash}.png
+# The picture comes from the XContest API. We keep a local copy so the gallery loads fast
+# and doesn't fire dozens of API requests on every page view.
+TASK_IMAGE_DIR = os.path.join(STORAGE_ROOT, "task_images")
+_SAFE_HASH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_IMAGE_RETRY_SECONDS = 300  # after a failed download, wait this long before trying again
+
+
+def task_image_url(task_hash) -> str:
+    return f"https://tools.xcontest.org/api/xctsk/image/{task_hash}"
+
+
+def task_image_path(task_hash):
+    """Local path of the saved picture, or None if the hash isn't safe to use in a file name."""
+    h = str(task_hash or "").strip()
+    if not _SAFE_HASH_RE.match(h):
+        return None
+    return os.path.join(TASK_IMAGE_DIR, f"{h}.png")
+
+
+def task_image_exists(task_hash) -> bool:
+    path = task_image_path(task_hash)
+    return bool(path and os.path.exists(path))
+
+
+def _looks_like_image(content: bytes, content_type: str) -> bool:
+    if content.startswith(b"\x89PNG") or content.startswith(b"\xff\xd8"):
+        return True
+    return (content_type or "").lower().startswith("image/")
+
+
+def download_task_image(task_hash) -> bool:
+    """Downloads the task picture from XContest and stores it on the volume. Returns True on success."""
+    path = task_image_path(task_hash)
+    if not path:
+        return False
+    try:
+        resp = requests.get(task_image_url(str(task_hash).strip()), timeout=8)
+        if resp.status_code != 200 or not resp.content:
+            return False
+        if not _looks_like_image(resp.content, resp.headers.get("Content-Type", "")):
+            return False
+        os.makedirs(TASK_IMAGE_DIR, exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as fh:
+            fh.write(resp.content)
+        os.replace(tmp_path, path)  # atomic: never leaves a half-written file
+        return True
+    except Exception:
+        return False
+
+
+def delete_task_image(task_hash) -> None:
+    path = task_image_path(task_hash)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+@st.cache_resource
+def _image_failures() -> dict:
+    """task_hash -> time of the last failed download (shared by all sessions)."""
+    return {}
+
+
+def get_task_image(task_hash, force: bool = False):
+    """Returns something st.image() can show: the local file if we have it (downloading it
+    first if needed), otherwise the XContest URL as a fallback. None if there is no hash."""
+    h = str(task_hash or "").strip()
+    if not h:
+        return None
+    path = task_image_path(h)
+    if path and (force or not os.path.exists(path)):
+        failures = _image_failures()
+        last_fail = failures.get(h)
+        if force or last_fail is None or (_time.time() - last_fail) > _IMAGE_RETRY_SECONDS:
+            if download_task_image(h):
+                failures.pop(h, None)
+            else:
+                failures[h] = _time.time()
+    if path and os.path.exists(path):
+        return path
+    return task_image_url(h)
+
+
+def _clean_takeoff(value) -> str:
+    """Trims and collapses whitespace so 'Mlolongo ' and 'Mlolongo' are the same take-off."""
+    return " ".join(str(value).split()) if value else ""
+
+
+def _task_label(t: dict) -> str:
+    """Label used in task dropdowns: description, take-off (if set) and max score."""
+    take_off = _clean_takeoff(t.get("take_off"))
+    if take_off:
+        return f"{t['description']} – {take_off} (Max Score: {t['max_score']})"
+    return f"{t['description']} (Max Score: {t['max_score']})"
 
 
 def _clean(value):
@@ -427,16 +532,36 @@ def validate_task_flight(task_data: dict, igc_fixes: list) -> dict:
         'flight_time_mins': flight_time_mins
     }
 
-def fetch_task_from_api(task_hash: str):
-    """Fetches the JSON task data from XContest API."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_task_json(task_hash: str):
+    """Cached XContest call. Raises on failure so errors are never cached."""
     url = f"https://tools.xcontest.org/api/xctsk/load/{task_hash}"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_task_from_api(task_hash: str):
+    """Fetches the JSON task data from XContest API (cached for an hour)."""
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            return response.json()
+        return _load_task_json(task_hash)
     except Exception as e:
         st.error(f"Failed to fetch task {task_hash}: {e}")
     return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_task_qr_svg(task_hash: str) -> str:
+    """Cached QR code (SVG text) for a task. Raises on failure so errors are never cached."""
+    task_json = _load_task_json(task_hash)
+    qr_response = requests.post(
+        "https://tools.xcontest.org/api/xctsk/qr",
+        json=task_json,
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    qr_response.raise_for_status()
+    return qr_response.text
 
 # -------------------------------------------------------------------
 # Page Renderers
@@ -525,39 +650,184 @@ def render_how_it_works_page():
     """)
 
 
-def render_task_gallery_page():
-    st.title("🗺️ Task Gallery")
-    st.markdown("Browse available cross-country tasks, preview route turnpoints, and download task files for your flight computer.")
+# --- Task Gallery state helpers -------------------------------------------------
+GALLERY_COLUMNS = 4        # thumbnails per row
+GALLERY_PAGE_SIZE = 20     # thumbnails per page
+NO_TAKEOFF_LABEL = "(not set)"
 
-    # Fetch tasks from the database
-    response = db("SELECT * FROM tasks")
-    tasks_data = response.data
 
-    if not tasks_data:
-        st.info("No tasks available in the gallery yet. Check back soon!")
+def _open_task(task_id):
+    st.session_state["gallery_selected_task_id"] = task_id
+
+
+def _close_task():
+    st.session_state["gallery_selected_task_id"] = None
+
+
+def _gallery_change_page(delta: int):
+    st.session_state["gallery_page"] = max(1, st.session_state.get("gallery_page", 1) + delta)
+
+
+def _gallery_filter_changed(field: str, widget_key: str):
+    """on_change callback: copy the widget's value into our own filter store and go back to page 1."""
+    value = st.session_state[widget_key]
+    if field == "score":
+        value = tuple(value)
+    elif field == "takeoff":
+        value = list(value)
+    st.session_state["gallery_filters"][field] = value
+    st.session_state["gallery_page"] = 1
+
+
+def _gallery_clear_filters():
+    st.session_state["gallery_filters"] = {"title": "", "takeoff": [], "score": None}
+    # New widget keys => widgets start fresh from the cleared store
+    st.session_state["gallery_reset_n"] = st.session_state.get("gallery_reset_n", 0) + 1
+    st.session_state["gallery_page"] = 1
+
+
+def _task_total_distance_km(task_json) -> float:
+    turnpoints = task_json.get("turnpoints", []) if task_json else []
+    total = 0.0
+    for i in range(1, len(turnpoints)):
+        try:
+            total += haversine_distance(
+                float(turnpoints[i - 1]["waypoint"]["lat"]), float(turnpoints[i - 1]["waypoint"]["lon"]),
+                float(turnpoints[i]["waypoint"]["lat"]), float(turnpoints[i]["waypoint"]["lon"]),
+            )
+        except Exception:
+            continue
+    return total / 1000.0
+
+
+def _render_gallery_pager(current: int, total: int, position: str):
+    if total <= 1:
+        return
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c1:
+        st.button("◀ Previous", key=f"gallery_prev_{position}", on_click=_gallery_change_page,
+                  args=(-1,), disabled=current <= 1)
+    with c2:
+        st.markdown(f"<div style='text-align:center; padding-top:0.4rem'>Page {current} of {total}</div>",
+                    unsafe_allow_html=True)
+    with c3:
+        st.button("Next ▶", key=f"gallery_next_{position}", on_click=_gallery_change_page,
+                  args=(1,), disabled=current >= total)
+
+
+def _render_gallery_grid(tasks_data):
+    # ---- Values the filters can offer, taken from the data
+    takeoff_options = sorted({_clean_takeoff(t.get("take_off")) for t in tasks_data} - {""}, key=str.lower)
+    if any(not _clean_takeoff(t.get("take_off")) for t in tasks_data):
+        takeoff_options.append(NO_TAKEOFF_LABEL)
+
+    scores = [float(t.get("max_score") or 0) for t in tasks_data]
+    score_lo = int(math.floor(min(scores) / 10.0) * 10)
+    score_hi = int(math.ceil(max(scores) / 10.0) * 10)
+    if score_hi <= score_lo:
+        score_hi = score_lo + 10
+
+    # ---- Filter values live in our own session_state entry, so they survive opening a task
+    filters = st.session_state.setdefault("gallery_filters", {"title": "", "takeoff": [], "score": None})
+    n = st.session_state.get("gallery_reset_n", 0)
+
+    s_lo, s_hi = filters.get("score") or (score_lo, score_hi)
+    s_lo = max(score_lo, min(int(s_lo), score_hi))
+    s_hi = max(score_lo, min(int(s_hi), score_hi))
+    if s_lo > s_hi:
+        s_lo, s_hi = score_lo, score_hi
+    takeoff_default = [x for x in filters.get("takeoff", []) if x in takeoff_options]
+
+    key_title, key_takeoff, key_score = f"gf_title_{n}", f"gf_takeoff_{n}", f"gf_score_{n}"
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+        with c1:
+            title_q = st.text_input("🔎 Title", value=filters.get("title", ""),
+                                    placeholder="Search by task title", key=key_title,
+                                    on_change=_gallery_filter_changed, args=("title", key_title))
+        with c2:
+            takeoff_sel = st.multiselect("📍 Take-off", options=takeoff_options, default=takeoff_default,
+                                         placeholder="All take-offs", key=key_takeoff,
+                                         on_change=_gallery_filter_changed, args=("takeoff", key_takeoff))
+        with c3:
+            score_range = st.slider("🏆 Max score", min_value=score_lo, max_value=score_hi,
+                                    value=(s_lo, s_hi), step=10, key=key_score,
+                                    on_change=_gallery_filter_changed, args=("score", key_score))
+        with c4:
+            st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+            st.button("Clear filters", key="gallery_clear_filters", on_click=_gallery_clear_filters)
+
+    # ---- Apply filters
+    query = (title_q or "").strip().lower()
+    min_score, max_score = score_range
+    filtered = []
+    for t in tasks_data:
+        if query and query not in (t.get("description") or "").lower():
+            continue
+        task_takeoff = _clean_takeoff(t.get("take_off")) or NO_TAKEOFF_LABEL
+        if takeoff_sel and task_takeoff not in takeoff_sel:
+            continue
+        if not (min_score <= float(t.get("max_score") or 0) <= max_score):
+            continue
+        filtered.append(t)
+
+    st.caption(f"Showing {len(filtered)} of {len(tasks_data)} tasks")
+    if not filtered:
+        st.info("No tasks match your filters. Try widening the score range or clearing the filters.")
         return
 
-    # Sort tasks by description
-    tasks_data = sorted(tasks_data, key=lambda x: x.get('description', ''))
+    # ---- Pagination
+    total_pages = max(1, math.ceil(len(filtered) / GALLERY_PAGE_SIZE))
+    page = min(max(st.session_state.get("gallery_page", 1), 1), total_pages)
+    st.session_state["gallery_page"] = page
+    page_tasks = filtered[(page - 1) * GALLERY_PAGE_SIZE: page * GALLERY_PAGE_SIZE]
 
-    # Select box to pick task
-    task_options = {f"{t['description']} (Max: {t['max_score']} pts)": t for t in tasks_data}
-    selected_label = st.selectbox("Select a Task to Preview:", options=list(task_options.keys()))
-    task = task_options[selected_label]
+    _render_gallery_pager(page, total_pages, "top")
+
+    # ---- Thumbnail grid
+    for row_start in range(0, len(page_tasks), GALLERY_COLUMNS):
+        cols = st.columns(GALLERY_COLUMNS)
+        for col, task in zip(cols, page_tasks[row_start: row_start + GALLERY_COLUMNS]):
+            with col:
+                with st.container(border=True):
+                    img = get_task_image(task.get("task_hash"))
+                    if img:
+                        st.image(img, width="stretch")
+                    else:
+                        st.caption("🖼️ No image")
+                    st.markdown(f"**{task.get('description', '')}**")
+                    take_off = _clean_takeoff(task.get("take_off")) or "not set"
+                    st.caption(f"📍 {take_off}  ·  🏆 {task.get('max_score', 0):g} pts")
+                    st.button("View details", key=f"view_task_{task['id']}",
+                              on_click=_open_task, args=(task["id"],))
+
+    _render_gallery_pager(page, total_pages, "bottom")
+
+
+def _render_task_detail(task):
+    st.button("← Back to all tasks", key="gallery_back_top", on_click=_close_task)
+
     task_hash = task.get("task_hash")
-
     if not task_hash:
         st.error("Invalid task configuration. Missing task hash.")
         return
 
+    take_off = _clean_takeoff(task.get("take_off")) or "Not set"
+    st.header(task["description"])
+
     task_json = fetch_task_from_api(task_hash)
+    turnpoints = task_json.get("turnpoints", []) if task_json else []
 
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        st.subheader(task['description'])
-        st.markdown(f"**Designer:** {task.get('designer', 'N/A')}")
+        st.markdown(f"**Designer:** {task.get('designer') or 'N/A'}")
+        st.markdown(f"**Take-off:** {take_off}")
         st.markdown(f"**Max Task Score:** {task.get('max_score', 1000)} pts")
+        if task_json:
+            st.markdown(f"**Task Distance:** {_task_total_distance_km(task_json):.1f} km")
+            st.markdown(f"**Turnpoints:** {len(turnpoints)}")
 
         xcontest_url = f"https://tools.xcontest.org/xctsk/load?taskCode={task_hash}"
         st.markdown(f"[🌍 View Full Task & Turnpoints on XContest]({xcontest_url})")
@@ -574,21 +844,58 @@ def render_task_gallery_page():
             )
 
             st.markdown("### Scan to Load Task")
-            qr_response = requests.post(
-                "https://tools.xcontest.org/api/xctsk/qr",
-                json=task_json,
-                headers={"Content-Type": "application/json"}
-            )
-
-            if qr_response.status_code == 200:
-                st.markdown(f"<div>{qr_response.text}</div>", unsafe_allow_html=True)
-            else:
+            try:
+                st.markdown(f"<div>{fetch_task_qr_svg(task_hash)}</div>", unsafe_allow_html=True)
+            except Exception:
                 st.warning("Could not generate QR code at this time.")
+        else:
+            st.warning("The task file could not be loaded from XContest right now, so the download and QR code are unavailable.")
 
     with col2:
         st.subheader("Task Route Map")
-        img_url = f"https://tools.xcontest.org/api/xctsk/image/{task_hash}"
-        st.image(img_url, caption=f"Map for {task['description']}", width="stretch")
+        img = get_task_image(task_hash)
+        if img:
+            st.image(img, caption=f"Map for {task['description']}", width="stretch")
+
+    if turnpoints:
+        with st.expander("Turnpoints"):
+            rows = []
+            for i, tp in enumerate(turnpoints, start=1):
+                wp = tp.get("waypoint", {})
+                rows.append({
+                    "#": i,
+                    "Name": wp.get("name", ""),
+                    "Type": tp.get("type", "TURNPOINT"),
+                    "Radius (m)": tp.get("radius"),
+                    "Lat": wp.get("lat"),
+                    "Lon": wp.get("lon"),
+                })
+            st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+
+def render_task_gallery_page():
+    st.title("🗺️ Task Gallery")
+
+    response = db("SELECT * FROM tasks")
+    tasks_data = response.data
+
+    if not tasks_data:
+        st.info("No tasks available in the gallery yet. Check back soon!")
+        return
+
+    # Sort tasks by description (case-insensitive)
+    tasks_data = sorted(tasks_data, key=lambda x: (x.get("description") or "").lower())
+
+    selected_id = st.session_state.get("gallery_selected_task_id")
+    if selected_id is not None:
+        task = next((t for t in tasks_data if t["id"] == selected_id), None)
+        if task:
+            _render_task_detail(task)
+            return
+        _close_task()  # task no longer exists (e.g. deleted by an admin)
+
+    st.markdown("Browse available cross-country tasks. Filter by title, take-off or max score, then click a task to see its full details, QR code and download link.")
+    _render_gallery_grid(tasks_data)
 
 
 def render_pilot_registration_page():
@@ -673,7 +980,7 @@ def render_flight_upload_page():
         )
 
         # Task Selection
-        task_options = {f"{t['description']} (Max Score: {t['max_score']})": t for t in tasks_data}
+        task_options = {_task_label(t): t for t in tasks_data}
         selected_task_label = st.selectbox("Select Task", options=list(task_options.keys()))
         selected_task = task_options[selected_task_label]
 
@@ -884,6 +1191,25 @@ def render_flight_upload_page():
             st.success(f"Flight submitted! Scores for {selected_task['description']} updated based on global speed and daily team sizes.")
             del st.session_state["eval_data"]
 
+def _get_takeoff_options():
+    """All take-off names currently used by tasks (cleaned, de-duplicated, alphabetical)."""
+    res = db("SELECT DISTINCT take_off FROM tasks WHERE take_off IS NOT NULL")
+    names = {_clean_takeoff(r["take_off"]) for r in res.data}
+    return sorted(names - {""}, key=str.lower)
+
+
+def _resolve_takeoff(selected, typed, existing) -> str:
+    """A typed take-off wins over the dropdown. If it matches an existing one (ignoring case)
+    the existing spelling is reused, so the filter never shows 'Mlolongo' and 'mlolongo' separately."""
+    typed = _clean_takeoff(typed)
+    if typed:
+        for option in existing:
+            if option.lower() == typed.lower():
+                return option
+        return typed
+    return _clean_takeoff(selected)
+
+
 def render_admin_page():
     st.title("🖥️ Admin Control Panel")
 
@@ -897,46 +1223,153 @@ def render_admin_page():
 
     tab1, tab2 = st.tabs(["Add Task", "Manage Tasks"])
 
+    # ------------------------------------------------------------------ Add Task
     with tab1:
         st.subheader("Add New Task")
+        existing_takeoffs = _get_takeoff_options()
+
         with st.form("add_task_form"):
             desc = st.text_input("Description")
             designer = st.text_input("Designer")
             max_score = st.number_input("Max Score", min_value=0, max_value=1000)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                takeoff_selected = st.selectbox(
+                    "Take-off (required)", options=existing_takeoffs, index=None,
+                    placeholder="Pick an existing take-off",
+                )
+            with col_b:
+                takeoff_typed = st.text_input(
+                    "…or type a new take-off",
+                    help="Only fill this in if the take-off isn't in the list. If you type something, it is used instead of the dropdown.",
+                )
+
             task_hash = st.text_input("Task Hash (e.g., c3262b39a20f1215)")
+            submitted = st.form_submit_button("Save Task")
 
-            if st.form_submit_button("Save Task"):
-                if not task_hash or not desc:
-                    st.error("Please provide both a description and a task hash.")
+        if submitted:
+            take_off = _resolve_takeoff(takeoff_selected, takeoff_typed, existing_takeoffs)
+            if not task_hash or not desc:
+                st.error("Please provide both a description and a task hash.")
+            elif not take_off:
+                st.error("Take-off is required. Pick an existing one or type a new one.")
+            else:
+                validate_task = fetch_task_from_api(task_hash.strip())
+                if not validate_task:
+                    st.error(f"Task with hash '{task_hash}' could not be loaded from XContest. Double check the code.")
                 else:
-                    validate_task = fetch_task_from_api(task_hash.strip())
-                    if not validate_task:
-                        st.error(f"Task with hash '{task_hash}' could not be loaded from XContest. Double check the code.")
+                    task_data = {
+                        "description": desc.strip(),
+                        "designer": designer,
+                        "max_score": max_score,
+                        "take_off": take_off,
+                        "task_hash": task_hash.strip()
+                    }
+                    db(
+                        """INSERT INTO tasks (description, designer, max_score, take_off, task_hash)
+                           VALUES (%(description)s, %(designer)s, %(max_score)s, %(take_off)s, %(task_hash)s)""",
+                        task_data,
+                    )
+                    if download_task_image(task_data["task_hash"]):
+                        st.success(f"Task added successfully (take-off: {take_off}) and its picture was saved.")
                     else:
-                        task_data = {
-                            "description": desc,
-                            "designer": designer,
-                            "max_score": max_score,
-                            "task_hash": task_hash.strip()
-                        }
-                        db(
-                            "INSERT INTO tasks (description, designer, max_score, task_hash) VALUES (%(description)s, %(designer)s, %(max_score)s, %(task_hash)s)",
-                            task_data,
-                        )
-                        st.success("Task added successfully via Hash!")
+                        st.success(f"Task added successfully (take-off: {take_off}).")
+                        st.warning("The task picture could not be downloaded right now. "
+                                   "Use 'Sync missing images' in the Manage Tasks tab to retry.")
 
+    # ------------------------------------------------------------------ Manage Tasks
     with tab2:
         st.subheader("Existing Tasks")
-        response = db("SELECT id, description, designer, max_score, task_hash FROM tasks")
-        if response.data:
-            df = pd.DataFrame(response.data)
-            df = df.sort_values(by="description").reset_index(drop=True)
-            st.dataframe(df)
+        response = db("SELECT id, description, designer, max_score, take_off, task_hash FROM tasks")
+        if not response.data:
+            st.info("No tasks yet.")
+            return
 
-            del_id = st.number_input("Task ID to Delete", min_value=1, step=1)
-            if st.button("Delete Task", type="primary"):
+        admin_tasks = sorted(response.data, key=lambda t: (t.get("description") or "").lower())
+        df = pd.DataFrame(admin_tasks)
+        df["image_saved"] = df["task_hash"].apply(task_image_exists)
+        st.dataframe(df, hide_index=True)
+
+        missing_takeoff = [t for t in admin_tasks if not _clean_takeoff(t.get("take_off"))]
+        if missing_takeoff:
+            st.warning(f"{len(missing_takeoff)} task(s) have no take-off yet. Use 'Edit task' below to fill it in "
+                       "(they show up as '(not set)' in the gallery filter until then).")
+
+        label_by_id = {t["id"]: f"#{t['id']} – {t['description']}" for t in admin_tasks}
+
+        # ---- Images
+        st.markdown("#### Task images")
+        n_missing_img = int((~df["image_saved"]).sum())
+        st.caption(f"{len(df) - n_missing_img} of {len(df)} task pictures are saved on the server.")
+        if st.button("🖼️ Sync missing images", disabled=n_missing_img == 0):
+            to_fetch = [t for t in admin_tasks if t.get("task_hash") and not task_image_exists(t["task_hash"])]
+            progress = st.progress(0.0, text="Downloading task pictures…")
+            ok = 0
+            for i, t in enumerate(to_fetch, start=1):
+                if download_task_image(t["task_hash"]):
+                    ok += 1
+                progress.progress(i / len(to_fetch), text=f"Downloading task pictures… {i}/{len(to_fetch)}")
+            progress.empty()
+            if ok == len(to_fetch):
+                st.success(f"Saved {ok} picture(s). Refresh to update the table.")
+            else:
+                st.warning(f"Saved {ok} of {len(to_fetch)} picture(s). The rest failed, so try again in a moment.")
+
+        # ---- Edit
+        st.markdown("#### Edit task")
+        edit_id = st.selectbox("Task to edit", options=list(label_by_id.keys()),
+                               format_func=lambda i: label_by_id[i], key="admin_edit_task_id")
+        edit_task = next(t for t in admin_tasks if t["id"] == edit_id)
+        edit_options = _get_takeoff_options()
+        current_takeoff = _clean_takeoff(edit_task.get("take_off"))
+        current_index = edit_options.index(current_takeoff) if current_takeoff in edit_options else None
+
+        with st.form(f"edit_task_form_{edit_id}"):
+            e_desc = st.text_input("Description", value=edit_task.get("description") or "", key=f"edit_desc_{edit_id}")
+            e_designer = st.text_input("Designer", value=edit_task.get("designer") or "", key=f"edit_designer_{edit_id}")
+            e_max = st.number_input("Max Score", min_value=0, max_value=1000,
+                                    value=min(1000, max(0, int(float(edit_task.get("max_score") or 0)))),
+                                    key=f"edit_max_{edit_id}")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                e_takeoff_sel = st.selectbox("Take-off (required)", options=edit_options, index=current_index,
+                                             placeholder="Pick an existing take-off", key=f"edit_takeoff_sel_{edit_id}")
+            with col_b:
+                e_takeoff_typed = st.text_input("…or type a new take-off", key=f"edit_takeoff_new_{edit_id}")
+            st.caption("The task hash can't be edited. To use a different XContest task, delete this one and add it again.")
+            save_edit = st.form_submit_button("Save changes")
+
+        if save_edit:
+            new_takeoff = _resolve_takeoff(e_takeoff_sel, e_takeoff_typed, edit_options)
+            if not e_desc.strip():
+                st.error("Description can't be empty.")
+            elif not new_takeoff:
+                st.error("Take-off is required. Pick an existing one or type a new one.")
+            else:
+                db(
+                    """UPDATE tasks SET description = %s, designer = %s, max_score = %s, take_off = %s
+                       WHERE id = %s""",
+                    (e_desc.strip(), e_designer, e_max, new_takeoff, int(edit_id)),
+                )
+                st.success("Task updated. Refresh to update the table.")
+
+        # ---- Delete
+        st.markdown("#### Delete task")
+        del_id = st.selectbox("Task to delete", options=list(label_by_id.keys()), index=None,
+                              placeholder="Choose a task", format_func=lambda i: label_by_id[i],
+                              key="admin_delete_task_id")
+        confirm_delete = st.checkbox("Yes, permanently delete this task", key="admin_delete_confirm")
+        if st.button("Delete Task", type="primary", disabled=(del_id is None or not confirm_delete)):
+            try:
+                doomed = next(t for t in admin_tasks if t["id"] == del_id)
                 db("DELETE FROM tasks WHERE id = %s", (int(del_id),))
+                still_used = db("SELECT 1 FROM tasks WHERE task_hash = %s LIMIT 1", (doomed.get("task_hash"),)).data
+                if not still_used:
+                    delete_task_image(doomed.get("task_hash"))
                 st.success("Task deleted. Refresh to update table.")
+            except Exception as e:
+                st.error(f"Could not delete the task (it may still have flights attached): {e}")
 
 def render_leaderboard_page():
     st.title("🏆 Leaderboard")
@@ -1137,6 +1570,11 @@ def render_leaderboard_page():
 # Navigation Routing
 # -------------------------------------------------------------------
 page = st.sidebar.radio("Navigation", ["Welcome", "Pilot Registration", "Task Gallery", "Flight Upload", "Leaderboard", "How It Works", "Admin"])
+
+# Whenever the user switches page, make sure the gallery opens on the grid, not on a previously opened task
+if st.session_state.get("_last_page") != page:
+    st.session_state["gallery_selected_task_id"] = None
+    st.session_state["_last_page"] = page
 
 if page == "Welcome":
     render_welcome_page()
