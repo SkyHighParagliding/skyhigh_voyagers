@@ -883,8 +883,11 @@ def render_task_gallery_page():
         st.info("No tasks available in the gallery yet. Check back soon!")
         return
 
-    # Sort tasks by description (case-insensitive)
-    tasks_data = sorted(tasks_data, key=lambda x: (x.get("description") or "").lower())
+    # Sort tasks by max score (ascending); ties are ordered by description (case-insensitive)
+    tasks_data = sorted(
+        tasks_data,
+        key=lambda x: (float(x.get("max_score") or 0), (x.get("description") or "").lower()),
+    )
 
     selected_id = st.session_state.get("gallery_selected_task_id")
     if selected_id is not None:
@@ -956,8 +959,8 @@ def render_flight_upload_page():
         st.warning("No tasks available. An admin needs to create tasks first.")
         return
 
-    # Sort tasks by description
-    tasks_data = sorted(tasks_data, key=lambda x: x.get('description', ''))
+    # Sort tasks by max score (ascending), then description
+    tasks_data = sorted(tasks_data, key=lambda x: (float(x.get('max_score') or 0), (x.get('description') or '').lower()))
 
     with st.form("pilot_inputs_form"):
         col1, col2, col3 = st.columns(3)
@@ -1286,7 +1289,7 @@ def render_admin_page():
             st.info("No tasks yet.")
             return
 
-        admin_tasks = sorted(response.data, key=lambda t: (t.get("description") or "").lower())
+        admin_tasks = sorted(response.data, key=lambda t: (float(t.get("max_score") or 0), (t.get("description") or "").lower()))
         df = pd.DataFrame(admin_tasks)
         df["image_saved"] = df["task_hash"].apply(task_image_exists)
         st.dataframe(df, hide_index=True)
@@ -1423,8 +1426,8 @@ def render_leaderboard_page():
     tasks_res = db("SELECT * FROM tasks")
     tasks_data = tasks_res.data if tasks_res.data else []
 
-    # Sort tasks by description
-    tasks_data = sorted(tasks_data, key=lambda x: x.get('description', ''))
+    # Sort tasks by max score (ascending), then description
+    tasks_data = sorted(tasks_data, key=lambda x: (float(x.get('max_score') or 0), (x.get('description') or '').lower()))
 
     task_options = ["Overall"] + [t["description"] for t in tasks_data]
     selected_option = st.selectbox("Select View", options=task_options)
