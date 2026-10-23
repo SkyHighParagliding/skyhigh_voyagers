@@ -1570,9 +1570,910 @@ def render_leaderboard_page():
             st.info("No score data available for this task.")
 
 # -------------------------------------------------------------------
+# Flight Replay: compare flights of the same task on one animated map
+# -------------------------------------------------------------------
+# How it works:
+#   1. The pilot picks a task, then ticks the flights they want to compare.
+#   2. For each flight we read the stored IGC file, detect take-off / landing, find the
+#      start-gate crossing and thin the track to one point every 5 s (10 s for very long
+#      flights). The result is cached, so re-opening the page is instant.
+#   3. Everything is handed to a self-contained Leaflet player (REPLAY_HTML) that runs
+#      completely in the browser. Playing, scrubbing and switching the time alignment
+#      never trigger a Streamlit rerun, which keeps the animation smooth.
+REPLAY_MAX_FLIGHTS = 10
+REPLAY_THIN_SECONDS = 5          # one track point every N seconds
+REPLAY_LONG_FLIGHT_SECONDS = 4 * 3600
+REPLAY_MOVING_MS = 4.0           # ground speed (m/s) that counts as "flying" when detecting take-off
+REPLAY_STOPPED_MS = 2.0          # ground speed (m/s) below which we consider the pilot landed
+# Colours chosen to stay readable on satellite imagery and to avoid the red used for task cylinders
+REPLAY_COLORS = ["#3b82ff", "#ffd60a", "#30d158", "#ff9f0a", "#bf5af2",
+                 "#22d3ee", "#ff6ec7", "#f5f5f5", "#c6f432", "#d2a679"]
+
+_REPLAY_CATEGORIES = ["Overall", "Only As", "As and Bs", "Only PG2s", "PG2s and PG3s", "PG4 or less"]
+
+
+def _igc_fixes(igc_text: str) -> list:
+    """Reads every B-record as (seconds_since_midnight, lat, lon, altitude_m).
+
+    Handles the midnight roll-over (time keeps counting past 86400) and drops duplicate /
+    out-of-order fixes. GPS altitude is preferred; pressure altitude is the fallback.
+    """
+    fixes = []
+    day_offset = 0
+    last_t = None
+    for line in igc_text.splitlines():
+        line = line.strip()
+        if not line.startswith("B") or len(line) < 35:
+            continue
+        try:
+            secs = int(line[1:3]) * 3600 + int(line[3:5]) * 60 + int(line[5:7])
+            lat = int(line[7:9]) + float(f"{line[9:11]}.{line[11:14]}") / 60.0
+            if line[14] == "S":
+                lat = -lat
+            lon = int(line[15:18]) + float(f"{line[18:20]}.{line[20:23]}") / 60.0
+            if line[23] == "W":
+                lon = -lon
+            alt_pressure = int(line[25:30])
+            alt_gps = int(line[30:35])
+        except (ValueError, IndexError):
+            continue
+
+        t = secs + day_offset
+        if last_t is not None and t < last_t - 43200:   # clock wrapped past midnight
+            day_offset += 86400
+            t += 86400
+        if last_t is not None and t <= last_t:          # duplicate or out-of-order fix
+            continue
+        last_t = t
+        fixes.append((t, lat, lon, alt_gps if alt_gps else alt_pressure))
+    return fixes
+
+
+def _thin_fixes(fixes: list, step: int) -> list:
+    """Keeps roughly one fix every `step` seconds (always keeps the first and last)."""
+    if not fixes:
+        return []
+    out = [fixes[0]]
+    last_t = fixes[0][0]
+    for f in fixes[1:]:
+        if f[0] - last_t >= step:
+            out.append(f)
+            last_t = f[0]
+    if out[-1] is not fixes[-1]:
+        out.append(fixes[-1])
+    return out
+
+
+def _detect_flight_window(thin: list):
+    """Returns (takeoff_index, landing_index) into a ~5 s thinned track.
+
+    Take-off  = start of the first ~20 s of sustained movement above REPLAY_MOVING_MS.
+    Landing   = end of the last ~15 s of sustained movement above REPLAY_STOPPED_MS.
+    Falls back to the whole track if no clear take-off / landing is found.
+    """
+    n = len(thin)
+    if n < 6:
+        return 0, n - 1
+    speed = [0.0] * n
+    for i in range(1, n):
+        dt = thin[i][0] - thin[i - 1][0]
+        if dt > 0:
+            speed[i] = haversine_distance(thin[i - 1][1], thin[i - 1][2], thin[i][1], thin[i][2]) / dt
+
+    takeoff = 0
+    for i in range(1, n - 3):
+        if all(speed[j] > REPLAY_MOVING_MS for j in range(i, i + 4)):
+            takeoff = i - 1
+            break
+
+    landing = n - 1
+    for i in range(n - 1, takeoff + 2, -1):
+        if all(speed[j] > REPLAY_STOPPED_MS for j in range(i - 2, i + 1)):
+            landing = min(n - 1, i + 1)
+            break
+
+    if landing <= takeoff + 1:
+        return 0, n - 1
+    return takeoff, landing
+
+
+def _find_start_time(task_json: dict, fixes: list, from_t: float):
+    """Time (seconds, same clock as the fixes) the pilot crossed the start gate, or None.
+
+    Uses the same rule as validate_task_flight: EXIT = leave the start cylinder after having
+    been inside; ENTER = move into it after having been outside.
+    """
+    tps = (task_json or {}).get("turnpoints") or []
+    sss_idx = next((i for i, tp in enumerate(tps) if tp.get("type") == "SSS"), None)
+    if sss_idx is None:
+        return None
+    try:
+        tp = tps[sss_idx]
+        radius = float(tp["radius"])
+        c_lat = float(tp["waypoint"]["lat"])
+        c_lon = float(tp["waypoint"]["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    direction = ((task_json.get("sss") or {}).get("direction") or "EXIT").upper()
+
+    was_inside = False
+    was_outside = False
+    for t, lat, lon, _alt in fixes:
+        if t < from_t:
+            continue
+        inside = haversine_distance(lat, lon, c_lat, c_lon) <= radius
+        if direction == "EXIT":
+            if inside:
+                was_inside = True
+            elif was_inside:
+                return t
+        else:
+            if not inside:
+                was_outside = True
+            elif was_outside:
+                return t
+    return None
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _build_replay_track(path: str, mtime: float, task_hash: str, _task_json: dict):
+    """Parses one stored IGC file into a compact, replay-ready track (cached).
+
+    `mtime` makes the cache refresh when a pilot re-uploads the file; `task_hash` keeps the
+    start-gate detection tied to the right task. `_task_json` is excluded from hashing.
+    Returns None when the file can't be read or has too few fixes.
+    """
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    fixes = _igc_fixes(text)
+    if len(fixes) < 10:
+        return None
+
+    thin = _thin_fixes(fixes, REPLAY_THIN_SECONDS)
+    i0, i1 = _detect_flight_window(thin)
+    track = thin[i0:i1 + 1]
+    if len(track) < 6:
+        return None
+
+    # Very long flights: keep every 2nd point so the payload stays small
+    if track[-1][0] - track[0][0] > REPLAY_LONG_FLIGHT_SECONDS:
+        track = track[::2] + ([track[-1]] if len(track) % 2 == 0 else [])
+
+    takeoff_t = track[0][0]
+    return {
+        "t": [int(p[0]) for p in track],
+        "lat": [round(p[1], 5) for p in track],
+        "lon": [round(p[2], 5) for p in track],
+        "alt": [int(round(p[3])) for p in track],
+        "takeoff_t": int(takeoff_t),
+        "start_t": _find_start_time(_task_json, fixes, takeoff_t),
+    }
+
+
+def _replay_task_overlay(task_json: dict, title: str) -> dict:
+    """Turns the XContest task JSON into what the map needs: circles, labels, cumulative km."""
+    tps_in = (task_json or {}).get("turnpoints") or []
+    sss_dir = ((task_json.get("sss") or {}).get("direction") or "EXIT").lower()
+    n = len(tps_in)
+    tps = []
+    cum = 0.0
+    prev = None
+    for i, tp in enumerate(tps_in):
+        wp = tp.get("waypoint") or {}
+        try:
+            lat, lon, radius = float(wp["lat"]), float(wp["lon"]), float(tp.get("radius") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if prev is not None:
+            cum += haversine_distance(prev[0], prev[1], lat, lon) / 1000.0
+        prev = (lat, lon)
+
+        tp_type = tp.get("type")
+        if i == n - 1:
+            role, direction = "goal", "entry"
+        elif tp_type == "TAKEOFF":
+            role, direction = "takeoff", "exit"
+        elif tp_type == "SSS":
+            role, direction = "start", sss_dir
+        elif tp_type == "ESS":
+            role, direction = "endspeed", "entry"
+        else:
+            role, direction = "waypoint", "entry"
+        tps.append({
+            "name": str(wp.get("name") or f"TP{i + 1}"),
+            "lat": lat, "lon": lon, "radius": radius,
+            "role": role, "dir": direction, "cum": round(cum, 2),
+        })
+    return {"title": title, "tps": tps}
+
+
+def _fmt_minutes(minutes) -> str:
+    """113.5 -> '1:53:30' (None / 0 -> '')."""
+    try:
+        total = int(round(float(minutes) * 60))
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _short_name(name: str) -> str:
+    """'James Brewer' -> 'James B.' (keeps the map labels compact)."""
+    parts = (name or "").split()
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[-1][0]}."
+    return name or "Pilot"
+
+
+def _flight_igc_file(flight: dict):
+    """Returns the real path of the flight's IGC file, or None if it's missing.
+
+    Tries the path stored in the database first, then the deterministic location
+    {STORAGE_ROOT}/task_{id}/date_{date}/{safa}.igc (handy if the volume was re-mounted
+    somewhere else). Anything outside STORAGE_ROOT is ignored.
+    """
+    root = os.path.realpath(STORAGE_ROOT)
+    candidates = []
+    if flight.get("igc_path"):
+        candidates.append(str(flight["igc_path"]))
+    try:
+        flight_date = _date.fromisoformat(str(flight["flight_date"])[:10]).isoformat()
+        candidates.append(os.path.join(
+            STORAGE_ROOT, f"task_{int(flight['task_id'])}",
+            f"date_{flight_date}", f"{int(flight['pilot_id'])}.igc"))
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    for candidate in candidates:
+        try:
+            real = os.path.realpath(candidate)
+        except (OSError, ValueError):
+            continue
+        if real.startswith(root + os.sep) and os.path.isfile(real):
+            return real
+    return None
+
+
+def _replay_category_match(flight: dict, category: str) -> bool:
+    glider_class = flight.get("glider_class")
+    pg_level = flight.get("pg_level")
+    if category == "Only As":
+        return glider_class == "A"
+    if category == "As and Bs":
+        return glider_class in ("A", "B")
+    if category == "Only PG2s":
+        return pg_level == "PG2"
+    if category == "PG2s and PG3s":
+        return pg_level in ("PG2", "PG3")
+    if category == "PG4 or less":
+        return pg_level in ("PG2", "PG3", "PG4")
+    return True
+
+
+def _replay_set_selection(key: str, values: list):
+    st.session_state[key] = list(values)
+
+
+def _replay_flight_label(f: dict) -> str:
+    score = f.get("total_score")
+    parts = [f.get("name") or f"Pilot {f.get('pilot_id')}", str(f.get("flight_date") or "")[:10]]
+    if score is not None:
+        parts.append(f"{float(score):g} pts")
+    t = _fmt_minutes(f.get("flight_time_minutes"))
+    if t:
+        parts.append(t)
+    return "  ·  ".join(p for p in parts if p)
+
+
+def _render_replay_player(payload: dict, height: int):
+    """Embeds the browser-side player. Data is JSON; '</' is escaped so a name can't close the script tag."""
+    data_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    html = REPLAY_HTML.replace("__DATA__", data_json)
+    import streamlit.components.v1 as components
+    components.html(html, height=height, scrolling=False)
+
+
+def render_flight_replay_page():
+    st.title("🎞️ Flight Replay")
+    st.markdown(
+        "Watch flights from the same task side by side. Pick a task, choose the flights you "
+        "want to compare, then press play. Everyone is lined up on the same clock, so you can "
+        "see who gets ahead, where, and why."
+    )
+
+    tasks_data = db("SELECT * FROM tasks").data
+    if not tasks_data:
+        st.info("No tasks available yet.")
+        return
+    tasks_data = sorted(
+        tasks_data,
+        key=lambda x: (float(x.get("max_score") or 0), (x.get("description") or "").lower()),
+    )
+    tasks_by_id = {t["id"]: t for t in tasks_data}
+    counts = {r["task_id"]: r["n"] for r in db("SELECT task_id, COUNT(*) AS n FROM flights GROUP BY task_id").data}
+
+    task_id = st.selectbox(
+        "Task",
+        options=[t["id"] for t in tasks_data],
+        format_func=lambda tid: f"{_task_label(tasks_by_id[tid])}  ·  {counts.get(tid, 0)} flight(s)",
+        key="replay_task_id",
+    )
+    task = tasks_by_id[task_id]
+    task_hash = task.get("task_hash")
+    if not task_hash:
+        st.error("This task has no task hash, so its route can't be drawn.")
+        return
+
+    flights = db(
+        """
+        SELECT f.pilot_id, f.task_id, f.flight_date, f.glider_class, f.paraglider,
+               f.total_score, f.flight_time_minutes, f.igc_path,
+               p.name, p.pg_level
+        FROM flights f
+        LEFT JOIN pilots p ON p.safa_number = f.pilot_id
+        WHERE f.task_id = %s
+        ORDER BY f.total_score DESC NULLS LAST, f.flight_date, p.name
+        """,
+        (task_id,),
+    ).data
+    if not flights:
+        st.info("Nobody has uploaded a flight for this task yet.")
+        return
+
+    # Only flights whose IGC file is on disk can be replayed
+    for f in flights:
+        f["_key"] = f"{f['pilot_id']}|{str(f['flight_date'])[:10]}"
+        f["_file"] = _flight_igc_file(f)
+    replayable = [f for f in flights if f["_file"]]
+    missing = len(flights) - len(replayable)
+    if not replayable:
+        st.warning("None of the flights for this task have a stored IGC file, so there is nothing to replay yet. "
+                   "Flights uploaded from now on will be available here.")
+        return
+
+    # --- Filters ---
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        category = st.selectbox("Category", _REPLAY_CATEGORIES, key="replay_category")
+    dates = sorted({str(f["flight_date"])[:10] for f in replayable}, reverse=True)
+    with fc2:
+        date_filter = st.multiselect("Flight date", dates, key=f"replay_dates_{task_id}",
+                                     placeholder="All dates")
+    visible = [f for f in replayable
+               if _replay_category_match(f, category)
+               and (not date_filter or str(f["flight_date"])[:10] in date_filter)]
+    if not visible:
+        st.info("No flights match these filters.")
+        return
+
+    by_key = {f["_key"]: f for f in visible}
+    option_keys = [f["_key"] for f in visible]          # already ordered best score first
+
+    # --- Flight selection (kept in session state so the quick buttons can change it) ---
+    sel_key = f"replay_sel_{task_id}"
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = option_keys[:3]
+    # Drop anything the current filters no longer offer (must happen before the widget is created)
+    st.session_state[sel_key] = [k for k in st.session_state[sel_key] if k in by_key][:REPLAY_MAX_FLIGHTS]
+
+    st.multiselect(
+        f"Flights to compare (up to {REPLAY_MAX_FLIGHTS}, type a name to search)",
+        options=option_keys,
+        format_func=lambda k: _replay_flight_label(by_key[k]),
+        max_selections=REPLAY_MAX_FLIGHTS,
+        key=sel_key,
+    )
+    b1, b2, b3, _ = st.columns([1, 1, 1, 3])
+    b1.button("Top 3", on_click=_replay_set_selection, args=(sel_key, option_keys[:3]),
+              key=f"replay_top3_{task_id}")
+    b2.button("Top 10", on_click=_replay_set_selection,
+              args=(sel_key, option_keys[:REPLAY_MAX_FLIGHTS]), key=f"replay_top10_{task_id}")
+    b3.button("Clear", on_click=_replay_set_selection, args=(sel_key, []),
+              key=f"replay_clear_{task_id}")
+    if missing:
+        st.caption(f"{missing} flight(s) on this task have no stored IGC file and can't be replayed.")
+
+    selected_keys = [k for k in option_keys if k in st.session_state[sel_key]]
+    if not selected_keys:
+        st.info("Select at least one flight to start the replay.")
+        return
+
+    task_json = fetch_task_from_api(task_hash)
+    if not task_json:
+        return  # fetch_task_from_api already showed the error
+    overlay = _replay_task_overlay(task_json, task["description"])
+    if not overlay["tps"]:
+        st.error("The task has no usable turnpoints.")
+        return
+
+    # --- Build the player payload ---
+    pilots, failed, table_rows = [], [], []
+    for idx, key in enumerate(selected_keys):
+        f = by_key[key]
+        track = _build_replay_track(f["_file"], os.path.getmtime(f["_file"]), task_hash, task_json)
+        name = f.get("name") or f"Pilot {f['pilot_id']}"
+        if not track:
+            failed.append(name)
+            continue
+        meta = [str(f["flight_date"])[:10]]
+        if f.get("glider_class"):
+            meta.append(f"Class {f['glider_class']}")
+        if f.get("total_score") is not None:
+            meta.append(f"{float(f['total_score']):g} pts")
+        flight_time = _fmt_minutes(f.get("flight_time_minutes"))
+        if flight_time:
+            meta.append(flight_time)
+        pilots.append({
+            "name": name,
+            "short": _short_name(name),
+            "meta": "  ·  ".join(meta),
+            "color": REPLAY_COLORS[idx % len(REPLAY_COLORS)],
+            **track,
+        })
+        table_rows.append({
+            "Pilot": name,
+            "Date": str(f["flight_date"])[:10],
+            "Class": f.get("glider_class") or "",
+            "Glider": f.get("paraglider") or "",
+            "Score": float(f["total_score"]) if f.get("total_score") is not None else None,
+            "Task time": flight_time,
+            "Start gate found": "Yes" if track["start_t"] is not None else "No",
+        })
+    if failed:
+        st.warning("Could not read the IGC file for: " + ", ".join(failed))
+    if not pilots:
+        return
+
+    with st.expander("Display options"):
+        map_height = st.slider("Map height (px)", min_value=420, max_value=1000, value=720, step=20,
+                               key="replay_map_height")
+
+    _render_replay_player({"task": overlay, "pilots": pilots}, int(map_height))
+
+    st.caption(
+        "Time is measured from each pilot's own take-off by default; switch to start gate or "
+        "clock time in the player. Take-off and landing are detected automatically from the track. "
+        "Click a pilot in the list on the map to follow them."
+    )
+    st.dataframe(pd.DataFrame(table_rows), hide_index=True)
+
+
+REPLAY_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  :root { --panel: rgba(16,21,27,.88); --edge: rgba(255,255,255,.14); --ink: #eef1f5; --dim: #9aa6b2; --accent: #ffd60a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #1b2229; color: var(--ink);
+    font: 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-variant-numeric: tabular-nums; }
+  #wrap { position: relative; height: 100%; overflow: hidden; }
+  #map { position: absolute; inset: 0; }
+  .panel { position: absolute; z-index: 1000; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 8px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  .panel h2 { margin: 0; padding: 8px 10px; font-size: 13px; font-weight: 650; cursor: pointer;
+    display: flex; justify-content: space-between; gap: 10px; user-select: none; }
+  .panel h2 span { color: var(--dim); font-weight: 400; }
+  .collapsed .body { display: none; }
+
+  /* Legend (top right) */
+  #legend { top: 10px; right: 10px; width: min(350px, calc(100% - 64px)); max-height: calc(100% - 130px);
+    display: flex; flex-direction: column; }
+  #legend .body { overflow: auto; border-top: 1px solid var(--edge); }
+  .prow { display: flex; gap: 9px; padding: 8px 10px; border-bottom: 1px solid var(--edge); align-items: flex-start; }
+  .prow:last-child { border-bottom: 0; }
+  .prow.off { opacity: .45; }
+  .prow input { margin: 3px 0 0; accent-color: var(--c); flex: none; width: 15px; height: 15px; }
+  .who { flex: 1; min-width: 0; cursor: pointer; border-radius: 4px; }
+  .who .nm { font-weight: 650; display: flex; align-items: center; gap: 6px; }
+  .who .nm i { width: 18px; height: 4px; border-radius: 2px; background: var(--c); flex: none; }
+  .who .meta { color: var(--dim); font-size: 11.5px; }
+  .who .live { margin-top: 3px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 2px 10px; }
+  .who .live b { font-weight: 650; }
+  .prow.follow { background: rgba(255,214,10,.10); }
+  .prow.follow .nm::after { content: "following"; color: var(--accent); font-weight: 500; font-size: 11px; }
+  #note { padding: 7px 10px; color: var(--accent); font-size: 11.5px; border-top: 1px solid var(--edge); display: none; }
+
+  /* Task table (bottom left) */
+  #wps { left: 10px; bottom: 96px; max-width: calc(100% - 20px); }
+  #wps .body { padding: 0 10px 8px; overflow-x: auto; }
+  #wps table { border-collapse: collapse; font-size: 12px; }
+  #wps td { padding: 1px 12px 1px 0; white-space: nowrap; }
+  #wps td.n { font-weight: 650; }
+  #wps td.r { text-align: right; color: var(--dim); }
+
+  /* Controls (bottom) */
+  #bar { left: 10px; right: 10px; bottom: 10px; padding: 8px 10px; }
+  #bar .line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+  #bar button, #bar select { height: 32px; background: rgba(255,255,255,.08); color: var(--ink);
+    border: 1px solid var(--edge); border-radius: 6px; font: inherit; padding: 0 10px; cursor: pointer; }
+  #bar button:hover, #bar select:hover { background: rgba(255,255,255,.16); }
+  #bar button:focus-visible, #bar select:focus-visible, #slider:focus-visible, .who:focus-visible
+    { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #bar button.go { background: var(--accent); color: #151515; border-color: var(--accent); font-weight: 700; min-width: 40px; }
+  #bar select option { color: #111; }
+  #clock { font-size: 20px; font-weight: 650; min-width: 126px; text-align: center; padding: 0 6px; }
+  #bar .sp { flex: 1; }
+  #slider { width: 100%; margin: 8px 0 0; accent-color: var(--accent); }
+
+  /* Map labels and markers */
+  .tp-wrap, .gl-wrap { background: none; border: none; }
+  .tp-wrap span { position: absolute; left: 6px; top: -9px; white-space: nowrap; font: 600 11px/1 system-ui, sans-serif;
+    color: #1a1a1a; background: rgba(255,255,255,.9); border: 1px solid #8a8a8a; padding: 2px 4px; border-radius: 3px; }
+  .gl { position: relative; width: 0; height: 0; }
+  .gl i { position: absolute; left: -7px; top: -7px; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--c); border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.55), 0 1px 5px rgba(0,0,0,.6); }
+  .gl b { position: absolute; left: 11px; top: -9px; white-space: nowrap; font: 650 11px/1 system-ui, sans-serif; color: #fff;
+    background: rgba(10,14,18,.78); padding: 3px 5px; border-radius: 4px; border-left: 3px solid var(--c); }
+  .leaflet-control-layers, .leaflet-bar a { color: #222; }
+
+  @media (max-width: 640px) {
+    #clock { font-size: 17px; min-width: 104px; }
+    #bar .sp { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="map"></div>
+
+  <div id="legend" class="panel">
+    <h2 id="legendHead"><b id="legendTitle">Flights</b><span id="legendToggle">hide</span></h2>
+    <div class="body"><div id="plist"></div><div id="note"></div></div>
+  </div>
+
+  <div id="wps" class="panel">
+    <h2 id="wpsHead"><b>Task</b><span id="wpsToggle">hide</span></h2>
+    <div class="body"><table id="wpsTable"></table></div>
+  </div>
+
+  <div id="bar" class="panel">
+    <div class="line">
+      <button id="bRestart" title="Back to the start" aria-label="Back to the start">&#9198;</button>
+      <button id="bBack" title="Back 5 minutes" aria-label="Back 5 minutes">&#9194;</button>
+      <button id="bPlay" class="go" title="Play / pause (space bar)" aria-label="Play">&#9654;</button>
+      <button id="bFwd" title="Forward 5 minutes" aria-label="Forward 5 minutes">&#9193;</button>
+      <div id="clock" aria-live="off">0:00:00</div>
+      <select id="sSpeed" title="Playback speed" aria-label="Playback speed">
+        <option value="1">1x</option><option value="5">5x</option><option value="10">10x</option>
+        <option value="30" selected>30x</option><option value="60">60x</option>
+        <option value="120">120x</option><option value="300">300x</option>
+      </select>
+      <select id="sAlign" title="What time zero means" aria-label="Time alignment">
+        <option value="takeoff" selected>Time since take-off</option>
+        <option value="start">Time since start gate</option>
+        <option value="clock">Clock time (UTC)</option>
+      </select>
+      <select id="sTrail" title="How much of each track to draw" aria-label="Trail length">
+        <option value="0" selected>Full trail</option>
+        <option value="1800">Last 30 min</option>
+        <option value="600">Last 10 min</option>
+        <option value="120">Last 2 min</option>
+        <option value="-1">No trail</option>
+      </select>
+      <span class="sp"></span>
+      <button id="bFit" title="Zoom to the whole task">Fit view</button>
+    </div>
+    <input id="slider" type="range" min="0" max="1" step="1" value="0" aria-label="Replay position">
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+(function () {
+  "use strict";
+  var D = __DATA__;
+
+  if (typeof L === "undefined") {
+    document.getElementById("map").innerHTML =
+      '<p style="padding:20px">The map library could not be loaded. Check your internet connection and reload the page.</p>';
+    return;
+  }
+
+  /* ---------- helpers ---------- */
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function fmtElapsed(s) {
+    var sign = s < 0 ? "-" : "";
+    s = Math.abs(Math.round(s));
+    return sign + Math.floor(s / 3600) + ":" + pad(Math.floor(s % 3600 / 60)) + ":" + pad(s % 60);
+  }
+  function fmtClock(s) {
+    s = ((Math.round(s) % 86400) + 86400) % 86400;
+    return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s % 3600 / 60)) + ":" + pad(s % 60) + " UTC";
+  }
+  function hav(lat1, lon1, lat2, lon2) {
+    var R = 6371000, r = Math.PI / 180, dp = (lat2 - lat1) * r, dl = (lon2 - lon1) * r;
+    var a = Math.sin(dp / 2) * Math.sin(dp / 2) +
+            Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dl / 2) * Math.sin(dl / 2);
+    return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+  function lastLE(arr, x) {            // last index with arr[i] <= x, or -1
+    var lo = 0, hi = arr.length - 1, r = -1;
+    while (lo <= hi) { var m = (lo + hi) >> 1; if (arr[m] <= x) { r = m; lo = m + 1; } else { hi = m - 1; } }
+    return r;
+  }
+  function firstGE(arr, x) {           // first index with arr[i] >= x, or arr.length
+    var lo = 0, hi = arr.length - 1, r = arr.length;
+    while (lo <= hi) { var m = (lo + hi) >> 1; if (arr[m] >= x) { r = m; hi = m - 1; } else { lo = m + 1; } }
+    return r;
+  }
+  function $(id) { return document.getElementById(id); }
+
+  /* ---------- map ---------- */
+  var tps = D.task.tps;
+  var map = L.map("map", { preferCanvas: true, zoomControl: true, worldCopyJump: false });
+  map.setView([tps[0].lat, tps[0].lon], 11);
+
+  var base = {
+    "Satellite": L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      { maxZoom: 19, attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics" }),
+    "Topo": L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+      { maxZoom: 17, attribution: "&copy; OpenStreetMap contributors, SRTM | &copy; OpenTopoMap (CC-BY-SA)" }),
+    "Streets": L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" })
+  };
+  base["Satellite"].addTo(map);
+  L.control.layers(base, null, { position: "topleft" }).addTo(map);
+
+  /* ---------- task ---------- */
+  var RED = "#ff4d4d";
+  tps.forEach(function (tp, i) {
+    L.circle([tp.lat, tp.lon], { radius: tp.radius, color: RED, weight: 1.4, fillColor: RED, fillOpacity: 0.17, interactive: false }).addTo(map);
+    L.marker([tp.lat, tp.lon], {
+      interactive: false, keyboard: false,
+      icon: L.divIcon({ className: "tp-wrap", html: "<span>" + (i + 1) + ". " + esc(tp.name) + "</span>", iconSize: [0, 0] })
+    }).addTo(map);
+  });
+  L.polyline(tps.map(function (t) { return [t.lat, t.lon]; }),
+    { color: RED, weight: 1.6, dashArray: "7 6", interactive: false }).addTo(map);
+
+  var wpsHtml = "";
+  tps.forEach(function (tp) {
+    wpsHtml += "<tr><td class='n'>" + esc(tp.name) + "</td><td>" + esc(tp.role) + "</td><td class='r'>" +
+      Math.round(tp.radius) + " m</td><td>" + esc(tp.dir) + "</td><td class='r'>" + tp.cum.toFixed(2) + " km</td></tr>";
+  });
+  $("wpsTable").innerHTML = wpsHtml;
+  var goal = tps[tps.length - 1];
+
+  /* ---------- pilots ---------- */
+  var pilots = D.pilots;
+  pilots.forEach(function (p, idx) {
+    var n = p.t.length;
+    p.spd = new Array(n); p.vz = new Array(n); p.ll = new Array(n);
+    for (var k = 0; k < n; k++) {
+      var a = Math.max(0, k - 1), b = Math.min(n - 1, k + 1), dt = p.t[b] - p.t[a];
+      p.spd[k] = dt > 0 ? hav(p.lat[a], p.lon[a], p.lat[b], p.lon[b]) / dt * 3.6 : 0;   // km/h
+      p.vz[k]  = dt > 0 ? (p.alt[b] - p.alt[a]) / dt : 0;                                // m/s
+      p.ll[k]  = [p.lat[k], p.lon[k]];
+    }
+    p.visible = true;
+    p.off = 0;
+    p.ghost = L.polyline(p.ll, { color: p.color, weight: 1.5, opacity: 0.3, interactive: false }).addTo(map);
+    p.trail = L.polyline([], { color: p.color, weight: 3.2, opacity: 0.95, interactive: false }).addTo(map);
+    p.marker = L.marker(p.ll[0], {
+      interactive: false, keyboard: false, opacity: 0, zIndexOffset: 1000 + idx,
+      icon: L.divIcon({ className: "gl-wrap", iconSize: [0, 0],
+        html: '<div class="gl" style="--c:' + p.color + '"><i></i><b>' + esc(p.short) + "</b></div>" })
+    }).addTo(map);
+  });
+
+  /* ---------- legend ---------- */
+  $("legendTitle").textContent = pilots.length + (pilots.length === 1 ? " flight" : " flights") + " on " + D.task.title;
+  var plist = $("plist");
+  pilots.forEach(function (p, idx) {
+    var row = document.createElement("div");
+    row.className = "prow";
+    row.style.setProperty("--c", p.color);
+    row.innerHTML =
+      '<input type="checkbox" checked aria-label="Show ' + esc(p.name) + '">' +
+      '<div class="who" tabindex="0" role="button" title="Click to follow this pilot">' +
+        '<div class="nm"><i></i><span>' + esc(p.name) + '</span></div>' +
+        '<div class="meta">' + esc(p.meta) + '</div>' +
+        '<div class="live">&nbsp;</div>' +
+      '</div>';
+    plist.appendChild(row);
+    p.row = row;
+    p.liveEl = row.querySelector(".live");
+    row.querySelector("input").addEventListener("change", function (e) {
+      p.visible = e.target.checked;
+      row.classList.toggle("off", !p.visible);
+      if (!p.visible) { p.ghost.setStyle({ opacity: 0 }); if (follow === idx) setFollow(-1); }
+      else { p.ghost.setStyle({ opacity: 0.3 }); }
+      render(true);
+    });
+    var who = row.querySelector(".who");
+    function toggleFollow() { setFollow(follow === idx ? -1 : idx); render(true); }
+    who.addEventListener("click", toggleFollow);
+    who.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); toggleFollow(); } });
+  });
+
+  /* ---------- state ---------- */
+  var mode = "takeoff", speed = 30, trailLen = 0, T = 0, Tmin = 0, Tmax = 1;
+  var playing = false, follow = -1, lastFrame = null, lastHeavy = 0;
+  var slider = $("slider");
+
+  function applyAlign() {
+    var missing = [];
+    pilots.forEach(function (p) {
+      p.fallback = false;
+      if (mode === "clock") { p.off = 0; }
+      else if (mode === "start") {
+        if (p.start_t != null) { p.off = p.start_t; }
+        else { p.off = p.takeoff_t; p.fallback = true; missing.push(p.short); }
+      } else { p.off = p.takeoff_t; }
+    });
+    Tmin = Infinity; Tmax = -Infinity;
+    pilots.forEach(function (p) {
+      var a = p.t[0] - p.off, b = p.t[p.t.length - 1] - p.off;
+      if (a < Tmin) Tmin = a;
+      if (b > Tmax) Tmax = b;
+    });
+    if (!isFinite(Tmin)) { Tmin = 0; Tmax = 1; }
+    slider.min = Math.floor(Tmin); slider.max = Math.ceil(Tmax);
+    var note = $("note");
+    if (missing.length) {
+      note.style.display = "block";
+      note.textContent = "No start gate crossing found, so these are aligned at take-off instead: " + missing.join(", ");
+    } else { note.style.display = "none"; }
+  }
+
+  function stateAt(p, ta) {
+    var n = p.t.length;
+    if (ta < p.t[0]) return { st: "pre" };
+    var i = lastLE(p.t, ta);
+    if (i >= n - 1) return { st: "landed", i: n - 1, lat: p.lat[n - 1], lon: p.lon[n - 1], alt: p.alt[n - 1], spd: 0, vz: 0 };
+    var f = (ta - p.t[i]) / (p.t[i + 1] - p.t[i]), g = 1 - f;
+    return {
+      st: "fly", i: i,
+      lat: p.lat[i] * g + p.lat[i + 1] * f, lon: p.lon[i] * g + p.lon[i + 1] * f,
+      alt: p.alt[i] * g + p.alt[i + 1] * f, spd: p.spd[i] * g + p.spd[i + 1] * f, vz: p.vz[i] * g + p.vz[i + 1] * f
+    };
+  }
+
+  function liveHtml(p, s) {
+    if (s.st === "pre") return "<span>not launched yet</span>";
+    var toGoal = Math.max(0, hav(s.lat, s.lon, goal.lat, goal.lon) - goal.radius) / 1000;
+    var vz = (s.vz >= 0 ? "+" : "") + s.vz.toFixed(1);
+    var status = s.st === "landed" ? "<span>landed &middot;</span>" : "";
+    return status + "<span><b>" + Math.round(s.alt).toLocaleString("en-US") + "</b> m</span>" +
+      (s.st === "landed" ? "" : "<span><b>" + Math.round(s.spd) + "</b> km/h</span><span><b>" + vz + "</b> m/s</span>") +
+      "<span><b>" + toGoal.toFixed(1) + "</b> km to goal</span>";
+  }
+
+  function setFollow(i) {
+    follow = i;
+    pilots.forEach(function (p, k) { p.row.classList.toggle("follow", k === i); });
+  }
+
+  function render(force) {
+    var now = performance.now();
+    var heavy = force || (now - lastHeavy > 110);
+    if (heavy) lastHeavy = now;
+
+    pilots.forEach(function (p) {
+      var s = stateAt(p, T + p.off);
+      p.s = s;
+      if (!p.visible || s.st === "pre") {
+        p.marker.setOpacity(0);
+        if (heavy) { p.trail.setLatLngs([]); if (p.visible) p.liveEl.innerHTML = liveHtml(p, s); }
+        return;
+      }
+      p.marker.setLatLng([s.lat, s.lon]);
+      p.marker.setOpacity(s.st === "landed" ? 0.6 : 1);
+      if (heavy) {
+        if (trailLen < 0) { p.trail.setLatLngs([]); }
+        else {
+          var i0 = trailLen > 0 ? firstGE(p.t, T + p.off - trailLen) : 0;
+          var pts = p.ll.slice(i0, s.i + 1);
+          pts.push([s.lat, s.lon]);
+          p.trail.setLatLngs(pts);
+        }
+        p.liveEl.innerHTML = liveHtml(p, s);
+      }
+    });
+
+    if (follow >= 0 && pilots[follow].s && pilots[follow].s.lat !== undefined) {
+      map.panTo([pilots[follow].s.lat, pilots[follow].s.lon], { animate: false });
+    }
+    $("clock").textContent = mode === "clock" ? fmtClock(T) : fmtElapsed(T);
+    slider.value = T;
+  }
+
+  function setT(v) { T = Math.max(Tmin, Math.min(Tmax, v)); render(true); }
+
+  function setPlaying(on) {
+    playing = on;
+    $("bPlay").innerHTML = on ? "&#10074;&#10074;" : "&#9654;";
+    $("bPlay").setAttribute("aria-label", on ? "Pause" : "Play");
+    lastFrame = null;
+    if (on) requestAnimationFrame(frame);
+  }
+  function frame(ts) {
+    if (!playing) return;
+    if (lastFrame === null) lastFrame = ts;
+    var dt = Math.min((ts - lastFrame) / 1000, 0.25);
+    lastFrame = ts;
+    T += dt * speed;
+    if (T >= Tmax) { T = Tmax; setPlaying(false); }
+    render(false);
+    if (playing) requestAnimationFrame(frame);
+  }
+
+  function fit() {
+    var b = L.latLngBounds([]);
+    tps.forEach(function (t) { b.extend([t.lat, t.lon]); });
+    pilots.forEach(function (p) { if (p.visible) b.extend(p.ghost.getBounds()); });
+    if (b.isValid()) map.fitBounds(b, { padding: [50, 50] });
+  }
+
+  /* ---------- controls ---------- */
+  $("bPlay").addEventListener("click", function () {
+    if (!playing && T >= Tmax) T = Tmin;
+    setPlaying(!playing);
+  });
+  $("bRestart").addEventListener("click", function () { setT(Tmin); });
+  $("bBack").addEventListener("click", function () { setT(T - 300); });
+  $("bFwd").addEventListener("click", function () { setT(T + 300); });
+  $("bFit").addEventListener("click", function () { setFollow(-1); fit(); });
+  $("sSpeed").addEventListener("change", function (e) { speed = +e.target.value; });
+  $("sTrail").addEventListener("change", function (e) { trailLen = +e.target.value; render(true); });
+  $("sAlign").addEventListener("change", function (e) {
+    mode = e.target.value;
+    applyAlign();
+    T = (mode === "start" && Tmin <= 0 && Tmax >= 0) ? 0 : Tmin;
+    render(true);
+  });
+  slider.addEventListener("input", function () { T = +slider.value; render(true); });
+  map.on("dragstart", function () { if (follow >= 0) setFollow(-1); });
+  document.addEventListener("keydown", function (e) {
+    var tag = (e.target && e.target.tagName) || "";
+    if (tag === "SELECT" || tag === "INPUT" || tag === "BUTTON") return;
+    if (e.code === "Space") { e.preventDefault(); $("bPlay").click(); }
+    else if (e.key === "ArrowRight") { setT(T + 10); }
+    else if (e.key === "ArrowLeft") { setT(T - 10); }
+  });
+
+  function wirePanel(headId, toggleId, panelId, startCollapsed) {
+    var panel = $(panelId), tog = $(toggleId);
+    function sync() { tog.textContent = panel.classList.contains("collapsed") ? "show" : "hide"; }
+    if (startCollapsed) panel.classList.add("collapsed");
+    $(headId).addEventListener("click", function () { panel.classList.toggle("collapsed"); sync(); });
+    sync();
+  }
+  var small = window.innerWidth < 700;
+  wirePanel("legendHead", "legendToggle", "legend", false);
+  wirePanel("wpsHead", "wpsToggle", "wps", small);
+
+  /* ---------- go ---------- */
+  applyAlign();
+  T = Tmin;
+  setTimeout(function () { map.invalidateSize(); fit(); render(true); }, 60);
+  window.addEventListener("resize", function () { map.invalidateSize(); });
+  render(true);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# -------------------------------------------------------------------
 # Navigation Routing
 # -------------------------------------------------------------------
-page = st.sidebar.radio("Navigation", ["Welcome", "Pilot Registration", "Task Gallery", "Flight Upload", "Leaderboard", "How It Works", "Admin"])
+page = st.sidebar.radio("Navigation", ["Welcome", "Pilot Registration", "Task Gallery", "Flight Upload", "Leaderboard", "Flight Replay", "How It Works", "Admin"])
 
 # Whenever the user switches page, make sure the gallery opens on the grid, not on a previously opened task
 if st.session_state.get("_last_page") != page:
@@ -1591,5 +2492,7 @@ elif page == "Flight Upload":
     render_flight_upload_page()
 elif page == "Leaderboard":
     render_leaderboard_page()
+elif page == "Flight Replay":
+    render_flight_replay_page()
 elif page == "Admin":
     render_admin_page()
